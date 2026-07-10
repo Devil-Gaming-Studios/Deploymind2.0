@@ -5,7 +5,7 @@ from google.adk.tools.mcp_tool import McpToolset
 from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from mcp import StdioServerParameters
 from pydantic import Field,BaseModel
-from typing import List,Optional,Dict
+from typing import List,Optional,Dict,Any
 from config import FAST_MODEL,SMART_MODEL
 
 class RepoInput(BaseModel):
@@ -23,7 +23,7 @@ class RepoOutput(BaseModel):
     deployment_files: List[str] = Field(
         description="Files affecting deployment and CI/CD"
     )
-    latest_deployment : Dict[str,str] = Field(
+    latest_deployment : Dict[str,Any] = Field(
         description = "The list of the files which were changed in the latest commit (file name -> file content)"
     )
     suspected_issue : Optional[str] = Field(

@@ -14,8 +14,8 @@ from dotenv import load_dotenv
 
 load_dotenv(".env")
 
-FAST_MODEL = os.getenv("FAST_MODEL", "gemini-2.5-flash")
-SMART_MODEL = os.getenv("SMART_MODEL", "gemini-2.5-flash")
+FAST_MODEL = os.getenv("FAST_MODEL", "gemini-flash-latest")
+SMART_MODEL = os.getenv("SMART_MODEL", "gemini-flash-latest")
 
 # import os
 # from dotenv import load_dotenv

@@ -29,6 +29,11 @@ from log_analysis_agent import (
     LogInput,
     LogOutput,
 )
+from IssueClassificationAgent import(
+    issue_classification_agent,
+    ClassificationInput,
+    ClassificationOutput,
+)
 from tools.vercel_agent import (
     get_deployment_logs,
     get_latest_failed_deployment,
@@ -45,9 +50,14 @@ from validation_agent import (
     FixValidationOutput, 
     validation_agent)
 
+from memory_store import compute_signature, load_memory, save_memory
+from tools.github_rest import get_latest_commit_sha
 
-MAX_LOOPING = 3
+
+MAX_LOOPING1 = 3
 APP_NAME = "deployMind"
+MAX_LOOPING0 = 3
+
 
 load_dotenv(".env")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
@@ -59,6 +69,35 @@ DEPLOYMENT_ID_FALLBACK = os.getenv("DEPLOYMENT_ID")
 REQUIRE_APPROVAL = os.getenv("REQUIRE_APPROVAL", "false").lower() in ("1", "true", "yes")
 VERCEL_PROJECT = os.getenv("VERCEL_PROJECT") or GITHUB_REPO
 TAVELY_TOKEN = os.getenv("TAVELY_TOKEN")
+
+# State keys that get persisted to disk under the failure signature after
+# every node, so a resumed run can skip straight past whatever already
+# completed successfully.
+CHECKPOINT_KEYS = [
+    "deployment_id",
+    "github_owner",
+    "repository_name",
+    "base_branch",
+    "commit_sha",
+    "repo_analysis_output",
+    "log_analysis",
+    "root_cause",
+    "retrieved_files",
+    "issue_classification",
+    "proposed_fix",
+    "validation",
+    "apply_result",
+]
+
+
+def _checkpoint(ctx: Context) -> None:
+    """Persist current progress to disk under this run's failure signature."""
+    signature = ctx.state.get("memory_signature")
+    if not signature:
+        return
+    snapshot = {k: ctx.state.get(k) for k in CHECKPOINT_KEYS}
+    save_memory(signature, snapshot)
+
 
 def as_model(value,model):
     if isinstance(value,model):
@@ -93,8 +132,60 @@ class DeploymentContext(BaseModel):
         default=None, description="Any project-specific instruction"
     )
 
+
+@node(rerun_on_resume=True)
+async def fetch_logs_and_check_memory_node(ctx: Context) -> None:
+    """Always-first node: fetch deployment logs, compute this failure's
+    signature, and if we've seen it before, hydrate ctx.state with whatever
+    progress was already made so downstream nodes can skip redundant work.
+    """
+    deploy_context = DeploymentContext.model_validate(ctx.state["deployment_context"])
+
+    logs = await get_deployment_logs(deploy_context.deployment_id, ctx.state["vercel_token"])
+    ctx.state["deployment_logs"] = logs
+    ctx.state["deployment_id"] = deploy_context.deployment_id
+    ctx.state["github_owner"] = deploy_context.github_owner
+    ctx.state["repository_name"] = deploy_context.github_repo
+    ctx.state["base_branch"] = deploy_context.base_branch
+
+    # Cheap, non-agentic lookup — anchors the signature to the actual commit
+    # being deployed, since repo_analysis_agent's latest_deployment field
+    # (and log_analysis_agent's diagnosis, which consumes it) both reason
+    # over this commit's real file contents. If it fails, commit_sha is None
+    # and compute_signature() degrades to log-text-only matching.
+    commit_sha = await get_latest_commit_sha(
+        deploy_context.github_owner,
+        deploy_context.github_repo,
+        deploy_context.base_branch,
+        ctx.state["github_token"],
+    )
+    ctx.state["commit_sha"] = commit_sha
+
+    signature = compute_signature(
+        deploy_context.github_owner, deploy_context.github_repo, logs, commit_sha
+    )
+    ctx.state["memory_signature"] = signature
+
+    cached = load_memory(signature)
+    if cached:
+        completed = [k for k in CHECKPOINT_KEYS if cached.get(k) is not None]
+        print(
+            f"[memory] Recognized this failure before (signature={signature}). "
+            f"Resuming — already have: {', '.join(completed) or 'nothing yet'}."
+        )
+        for key, value in cached.items():
+            if value is not None:
+                ctx.state[key] = value
+    else:
+        print(f"[memory] New failure signature ({signature}) — starting fresh.")
+
+
 @node(rerun_on_resume=True)
 async def repo_analysis_node(ctx:Context) -> RepoOutput:
+    if ctx.state.get("repo_analysis_output"):
+        print("[memory] Reusing cached repo analysis — skipping GitHub MCP calls.")
+        return RepoOutput.model_validate(ctx.state["repo_analysis_output"])
+
     toolset,github_analysis_model = await create_github_analysis_agent(ctx.state["github_token"])
     deploy_context = DeploymentContext.model_validate(ctx.state["deployment_context"])
     repo_input=RepoInput(
@@ -117,20 +208,25 @@ async def repo_analysis_node(ctx:Context) -> RepoOutput:
 
     await toolset.close()
     print(result)
+    _checkpoint(ctx)
     return result
 
-@node(rerun_on_resume=True)
+#@node(rerun_on_resume=True)
 async def log_analysis_node(ctx:Context)->LogOutput:
-    tavely_toolset,log_analysis_agent = await create_log_analysis_agent(ctx.state["vercel_token"])
+    if ctx.state.get("log_analysis") and ctx.state.get("iteration_no", 1) == 1:
+        print("[memory] Reusing cached log analysis — skipping log-analysis LLM calls.")
+        return LogOutput.model_validate(ctx.state["log_analysis"])
+
+    tavely_toolset,log_analysis_agent = await create_log_analysis_agent(ctx.state["tavely_token"])
     repo_analysis_output = as_model(ctx.state["repo_analysis_output"],RepoOutput)
 
-    retrived_files : Dict[str,str] = {}
+    retrived_files : Dict[str,str] = ctx.state.get("retrieved_files") or {}
     analysis_result: Optional[LogOutput] = None
 
-    logs = await get_deployment_logs(ctx.state["deployment_id"], ctx.state["vercel_token"])
-    ctx.state["deployment_logs"] = logs
+    # Logs were already fetched by fetch_logs_and_check_memory_node.
+    logs = ctx.state["deployment_logs"]
 
-    for round_num in range(MAX_LOOPING):
+    for round_num in range(MAX_LOOPING1):
         log_input = LogInput(
             deployment_logs = logs,
             repo_output = repo_analysis_output,
@@ -153,9 +249,19 @@ async def log_analysis_node(ctx:Context)->LogOutput:
             files_required = analysis_result.required_files
         )
 
-        file_retrived = as_model(
-            await ctx.run_node(file_retrival_agent, node_input = file_agent_input),file_retrival_output
-        )
+        file_retrived_raw = await ctx.run_node(file_retrival_agent, node_input=file_agent_input)
+        await file_retriver_toolset.close()
+
+        if file_retrived_raw is None:
+            print(
+                "File retrieval agent returned no structured result this round "
+                "(likely a dropped/incomplete turn) — continuing without new files."
+            )
+        else:
+            file_retrived = as_model(file_retrived_raw, file_retrival_output)
+            retrived_files.update(file_retrived.files)
+            ctx.state["retrieved_files"] = retrived_files
+            print(f'iteration {round_num} :\nroot cause : {analysis_result.root_cause}\nfiles retrived : {retrived_files}\n')
 
         await file_retriver_toolset.close()
 
@@ -172,17 +278,47 @@ async def log_analysis_node(ctx:Context)->LogOutput:
     await tavely_toolset.close()
 
     print(analysis_result)
+    _checkpoint(ctx)
     return analysis_result
 
-@node(rerun_on_resume=True)
+#@node(rerun_on_resume=True) 
+async def issue_classification_agent_node(ctx:Context) -> ClassificationOutput:
+    if ctx.state.get("issue_classification") and ctx.state.get("iteration_no", 1) == 1:
+        print("[memory] Reusing cached issue classification — skipping classification LLM call.")
+        return ClassificationOutput.model_validate(ctx.state["issue_classification"])
+
+    repo_analysis_output = as_model(ctx.state["repo_analysis_output"],RepoOutput)
+    log_analysis_output = as_model(ctx.state["log_analysis"],LogOutput)
+
+    issue_classification_input = ClassificationInput(
+        repo_output = repo_analysis_output,
+        log_output = log_analysis_output,
+    )
+
+    result = as_model(await ctx.run_node(issue_classification_agent,node_input = issue_classification_input),ClassificationOutput)
+
+    print(result.category)
+
+    ctx.state["issue_classification"] = result.model_dump()
+    _checkpoint(ctx)
+
+    return result
+
+#@node(rerun_on_resume=True)
 async def fix_node(ctx:Context) -> fix_generator_output:
+    if ctx.state.get("proposed_fix") and ctx.state.get("iteration_no", 1) == 1:
+        print("[memory] Reusing cached proposed fix — skipping fix-generation LLM call.")
+        return fix_generator_output.model_validate(ctx.state["proposed_fix"])
+
     toolset,fix_generator_agent = await create_fix_generator_agent(ctx.state["tavely_token"])
     repo_analysis_output = as_model(ctx.state["repo_analysis_output"],RepoOutput)
     log_analysis_output = as_model(ctx.state["log_analysis"],LogOutput)
+    issue_classification_output = as_model(ctx.state["issue_classification"],ClassificationOutput)
 
     fix_agent_input = fix_generator_input(
         deployment_logs = ctx.state["deployment_logs"],
         root_cause = log_analysis_output.root_cause,
+        classification = issue_classification_output,
         log_snippet = log_analysis_output.useful_snippet,
         repo_analysis_output = repo_analysis_output,
         relavent_files = ctx.state["retrieved_files"],
@@ -198,10 +334,15 @@ async def fix_node(ctx:Context) -> fix_generator_output:
     for change in result.file_changes:
             print(f"  - {change.file_path}: {change.change_summary}")
 
+    _checkpoint(ctx)
     return result
 
-@node(rerun_on_resume=True)
+#@node(rerun_on_resume=True)
 async def validation_node(ctx: Context) -> FixValidationOutput:
+    if ctx.state.get("validation") and ctx.state.get("iteration_no", 1) == 1:
+        print("[memory] Reusing cached validation result — skipping validation LLM call.")
+        return FixValidationOutput.model_validate(ctx.state["validation"])
+
     fix = as_model(ctx.state["proposed_fix"],fix_generator_output)
     repo_analysis = as_model(ctx.state["repo_analysis_output"],RepoOutput)
     validation = as_model(
@@ -222,7 +363,22 @@ async def validation_node(ctx: Context) -> FixValidationOutput:
         f"valid={validation.is_valid}",
         f"needs_human_approval={validation.needs_human_approval}",
     )
+    _checkpoint(ctx)
     return validation
+
+@node(rerun_on_resume = True)
+async def log_analysis_to_validation_node(ctx:Context):
+    for _ in range(MAX_LOOPING0):
+        log_analysis_output = await log_analysis_node(ctx)
+        issue_classification_output = await issue_classification_agent_node(ctx)
+        fix_agent_output = await fix_node(ctx)
+        validation_output = await validation_node(ctx)
+
+        ctx.state["iteration_no"] = ctx.state.get("iteration_no",1) + 1
+        if validation_output.is_valid or not validation_output.issues_found :
+            break
+
+    return validation_output
 
 async def request_human_approval(
     fix: fix_generator_output, validation: FixValidationOutput
@@ -248,6 +404,10 @@ async def request_human_approval(
 
 @node(rerun_on_resume=True)
 async def apply_fix_node(ctx: Context):
+    if ctx.state.get("apply_result"):
+        print("[memory] This exact fix was already applied previously — skipping re-apply.")
+        return ctx.state["apply_result"]
+
     validation = FixValidationOutput.model_validate(ctx.state["validation"])
     fix = fix_generator_output.model_validate(ctx.state["proposed_fix"])
 
@@ -302,6 +462,7 @@ async def apply_fix_node(ctx: Context):
     apply_result = as_model(raw_result, FixApplyOutput)
     print("Apply result:", apply_result)
     ctx.state["apply_result"] = apply_result.model_dump()
+    _checkpoint(ctx)
 
     if not apply_result.success:
         print("GitHub fix agent reported failure; skipping redeploy.")
@@ -325,15 +486,20 @@ async def apply_fix_node(ctx: Context):
 root_agent = Workflow(
     name="root_agent",
     edges=[
-        ("START", repo_analysis_node),
-        (repo_analysis_node, log_analysis_node),
-        (log_analysis_node, fix_node),
-        (fix_node, validation_node),
-        (validation_node, apply_fix_node)
+        ("START", fetch_logs_and_check_memory_node),
+        (fetch_logs_and_check_memory_node, repo_analysis_node),
+        (repo_analysis_node,log_analysis_to_validation_node),
+        #(repo_analysis_node, log_analysis_node),
+        # (log_analysis_node, issue_classification_agent_node),
+        # (issue_classification_agent_node, fix_node),
+        # (fix_node, validation_node),
+        #(validation_node, apply_fix_node)
+        (log_analysis_to_validation_node,apply_fix_node)
     ],
 )
 
 async def async_main():
+    iteration_no = 1
     session_service = InMemorySessionService()
     missing = [
         name
